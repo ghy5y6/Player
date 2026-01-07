@@ -10,7 +10,8 @@ if SERVER then
     util.AddNetworkString("MusicPlayer_Control")   -- Sync controls (Stop, Volume, Pitch, Seek)
     util.AddNetworkString("MusicPlayer_Open")      -- Open command
     util.AddNetworkString("MusicPlayer_Queue")     -- Queue management
-    
+    util.AddNetworkString("MusicPlayer_AddResource") -- Send sound to server (resource.AddFile)
+
     -- Simple Play
     net.Receive("MusicPlayer_Broadcast", function(len, ply)
         if not ply:IsAdmin() then return end -- [SECURED] Only Admins can play global
@@ -75,13 +76,49 @@ if SERVER then
         end
     end)
 
-    -- [FIX] SERVER SIDE CHAT COMMAND (Hides message from all players)
+    -- [FEATURE] SEND SOUND TO SERVER (Resource Add)
+    net.Receive("MusicPlayer_AddResource", function(len, ply)
+        if not ply:IsAdmin() then return end
+        
+        local path = net.ReadString()
+        
+        if string.find(path, "..") then return end
+
+        if file.Exists(path, "GAME") then
+            resource.AddFile(path)
+            ply:ChatPrint("[Music Player] Added '" .. path .. "' to download list.")
+            
+            local saveFile = "music_player_resources.txt"
+            local currentContent = file.Exists(saveFile, "DATA") and file.Read(saveFile, "DATA") or ""
+            
+            if not string.find(currentContent, path, 1, true) then
+                file.Append(saveFile, path .. "\n")
+            end
+        else
+            ply:ChatPrint("[Music Player] Error: Server could not find file: " .. path)
+            ply:ChatPrint("[Music Player] Note: The server must already have the file.")
+        end
+    end)
+
+    hook.Add("Initialize", "LoadMusicPlayerResources", function()
+        local saveFile = "music_player_resources.txt"
+        if file.Exists(saveFile, "DATA") then
+            local content = file.Read(saveFile, "DATA")
+            for line in string.gmatch(content, "[^\r\n]+") do
+                if file.Exists(line, "GAME") then
+                    resource.AddFile(line)
+                end
+            end
+        end
+    end)
+
+    -- [FIX] SERVER SIDE CHAT COMMAND (Hides /player, /mp, !player, !mp from everyone)
     hook.Add("PlayerSay", "GabesPlayerChatCommand", function(ply, text)
         local cmd = string.lower(text)
-        if cmd == "/player" or cmd == "!player" then
+        if cmd == "/player" or cmd == "!player" or cmd == "/mp" or cmd == "!mp" then
             net.Start("MusicPlayer_Open")
             net.Send(ply)
-            return "" -- This prevents message from showing in chat
+            return "" -- This prevents message from showing in chat for anyone
         end
     end)
 
@@ -94,11 +131,15 @@ end
 local playerFrame = nil 
 local isHidden = false
 
+-- [FIX] MANUAL DRAGGING FLAGS
+local LocalPlayerDraggingVol = false
+local LocalPlayerDraggingPitch = false
+
 -- [FIX] CHAT MESSAGE HIDING FOR LOCAL PLAYER
 hook.Add("OnPlayerChat", "HideMusicPlayerCommand", function(ply, text, team, isDead)
     if ply == LocalPlayer() then
         local cmd = string.lower(text)
-        if cmd == "/player" or cmd == "!player" then
+        if cmd == "/player" or cmd == "!player" or cmd == "/mp" or cmd == "!mp" then
             return true -- Hide from local chat
         end
     end
@@ -109,9 +150,12 @@ end)
 -- -----------------------------------------------------------
 local currentStream = nil
 local currentVolume = 0.5
+local currentPitch = 1.0
 local currentDuration = 0
 local currentSongName = "Stopped."
 local lastPath = cookie.GetString("gabes_music_path", "C:/")
+local isPaused = false -- [NEW] Pause State
+local cachedFFT = {} -- [NEW] Store visualizer data to freeze it on pause
 
 -- Sync State
 local isNetworkedPlayback = false 
@@ -219,9 +263,14 @@ net.Receive("MusicPlayer_Broadcast", function()
     local path = net.ReadString()
     if not musicplayer then return end
     
+    -- [FIX] Prevent double notification for the sender
+    if amITheDJ then return end
+
     notification.AddLegacy("Global Play: " .. string.GetFileFromFilename(path), NOTIFY_GENERIC, 4)
     
     if GlobalMusicStream then musicplayer.Stop(GlobalMusicStream) end
+    
+    isPaused = false -- Reset pause state
     
     GlobalMusicStream = musicplayer.Play(path)
     currentStream = GlobalMusicStream
@@ -230,12 +279,14 @@ net.Receive("MusicPlayer_Broadcast", function()
     
     if currentStream then 
         musicplayer.SetVolume(currentStream, currentVolume)
+        musicplayer.SetPitch(currentStream, currentPitch) -- Use normalized pitch
         currentDuration = musicplayer.GetLength(currentStream)
         currentSongName = "[NET] " .. string.GetFileFromFilename(path)
         
+        -- [FIX] Keep generic stop button as "STOP" to avoid confusion with "STOP GLOBAL" button
         if IsValid(playerFrame) and IsValid(playerFrame.btnStop) then
-            playerFrame.btnStop:SetText("STOP (GLOBAL)")
-            playerFrame.btnStop.Paint = function(s,w,h) draw.RoundedBox(4,0,0,w,h, Color(220, 50, 50)) end 
+            playerFrame.btnStop:SetText("STOP")
+            playerFrame.btnStop.Paint = function(s,w,h) draw.RoundedBox(4,0,0,w,h, Color(180, 50, 50)) end 
         end
     end
 end)
@@ -248,6 +299,7 @@ net.Receive("MusicPlayer_Control", function()
     if type == "stop" then
         if currentStream then musicplayer.Stop(currentStream) end
         currentStream = nil
+        isPaused = false
         currentSongName = "Stopped by Host."
         isNetworkedPlayback = false
         amITheDJ = false 
@@ -259,10 +311,23 @@ net.Receive("MusicPlayer_Control", function()
         
     elseif type == "update" then
         currentVolume = val1
+        currentPitch = val2 -- Update state
+        
         if currentStream then
             musicplayer.SetVolume(currentStream, currentVolume)
-            musicplayer.SetPitch(currentStream, val2)
+            musicplayer.SetPitch(currentStream, currentPitch) -- Apply raw pitch
         end
+        
+        -- [FIX] Update UI sliders using manual flags instead of GetDragging()
+        if IsValid(playerFrame) then
+            if IsValid(playerFrame.VolSlider) and not LocalPlayerDraggingVol then
+                playerFrame.VolSlider:SetValue(val1)
+            end
+            if IsValid(playerFrame.PitchSlider) and not LocalPlayerDraggingPitch then
+                playerFrame.PitchSlider:SetValue(val2)
+            end
+        end
+        
     elseif type == "seek" then
         if currentStream then
             musicplayer.SetPos(currentStream, val1)
@@ -647,44 +712,46 @@ local function InitMusicSystem()
         AddShortcut(name, path, "folder")
     end
 
-shortcutList.OnRowSelected = function(lst, idx, pnl)
-    if pnl.Type == "folder" then
-        ScanAndPopulate(pnl.Path)
+    shortcutList.OnRowSelected = function(lst, idx, pnl)
+        if pnl.Type == "folder" then
+            ScanAndPopulate(pnl.Path)
 
-    elseif pnl.Type == "file" then
-        -- File pin: Go to folder, highlight file, scroll to it
-        if pnl.FolderPath then
-            ScanAndPopulate(pnl.FolderPath)
+        elseif pnl.Type == "file" then
+            -- File pin: Go to folder, highlight file, scroll to it
+            if pnl.FolderPath then
+                ScanAndPopulate(pnl.FolderPath)
 
-            -- Wait one frame for list layout
-            timer.Simple(0, function()
-                if not IsValid(listView) then return end
+                -- Wait one frame for list layout
+                timer.Simple(0, function()
+                    if not IsValid(listView) then return end
 
-                local targetPath = string.Replace(pnl.Path or "", "\\", "/")
+                    local targetPath = string.Replace(pnl.Path or "", "\\", "/")
 
-                -- Clear selection properly
-                listView:ClearSelection()
+                    -- Clear selection properly
+                    listView:ClearSelection()
 
-                for _, line in ipairs(listView:GetLines()) do
-                    local linePath = string.Replace(line.Path or "", "\\", "/")
+                    for _, line in ipairs(listView:GetLines()) do
+                        local linePath = string.Replace(line.Path or "", "\\", "/")
 
-                    if linePath == targetPath then
-                        -- ✅ Correct way to select a line
-                        line:SetSelected(true)
+                        if linePath == targetPath then
+                            -- ✅ Correct way to select a line
+                            line:SetSelected(true)
 
-                        -- ✅ Scroll to the selected line safely
-                        if listView.VBar then
-                            listView.VBar:SetScroll(line:GetY())
+                            -- ✅ Scroll to selected line safely
+                            if listView.VBar then
+                                listView.VBar:SetScroll(line:GetY())
+                            end
+
+                            -- [FIX] Manually set the SelectedFile so "PLAY SELECTED" works immediately
+                            frame.SelectedFile = line.Path 
+
+                            break
                         end
-
-                        break
                     end
-                end
-            end)
+                end)
+            end
         end
     end
-end
-
 
     shortcutList.OnRowRightClick = function(lst, idx, pnl)
         local menu = DermaMenu()
@@ -861,22 +928,6 @@ end
     chkLocal:SetValue(isLocalMode)
     chkLocal.OnChange = function(s, val) isLocalMode = val; cookie.Set("gabe_local_mode", val and 1 or 0) end
 
-    -- [FIX] LOOP BUTTON
-    local btnLoop = vgui.Create("DButton", queueControls)
-    btnLoop:Dock(LEFT); btnLoop:SetText("Loop Track"); btnLoop:SetWidth(100); btnLoop:DockMargin(10, 5, 0, 5)
-    btnLoop.Paint = function(s, w, h)
-        if isLooping then
-            draw.RoundedBox(4, 0, 0, w, h, Theme.accent)
-        else
-            draw.RoundedBox(4, 0, 0, w, h, Theme.panel_bg)
-        end
-        surface.SetDrawColor(Theme.outline); surface.DrawOutlinedRect(0,0,w,h)
-    end
-    btnLoop.DoClick = function()
-        isLooping = not isLooping
-        notification.AddLegacy(isLooping and "Loop enabled" or "Loop disabled", NOTIFY_GENERIC, 2)
-    end
-
     local btnClearQ = vgui.Create("DButton", queueControls)
     btnClearQ:Dock(RIGHT); btnClearQ:SetText("Clear Queue"); btnClearQ:SetWidth(100)
     
@@ -914,6 +965,8 @@ end
             for _, col in pairs(line.Columns) do col:SetTextColor(Theme.text) end
         end
     end
+    -- [CRITICAL FIX] Attach RefreshQueueList to frame so network receiver can find it
+    frame.RefreshQueueList = RefreshQueueList
     RefreshQueueList()
 
     -- [FIX] ADD TO QUEUE LOGIC (Admin-only networking)
@@ -1005,6 +1058,15 @@ end
                 menu:AddOption("Add to Queue", function() 
                     AddToQueue(pnl.Path, string.GetFileFromFilename(pnl.Path))
                 end):SetIcon("icon16/add.png")
+            end
+
+            -- [FEATURE] SEND TO SERVER (Resource Add)
+            if LocalPlayer():IsAdmin() then
+                menu:AddOption("Send to Server (Add to DL List)", function()
+                    net.Start("MusicPlayer_AddResource")
+                    net.WriteString(pnl.Path)
+                    net.SendToServer()
+                end):SetIcon("icon16/server_connect.png")
             end
             
             -- ADD TO COLLECTION SUBMENU
@@ -1126,20 +1188,26 @@ end
     visualizer.Paint = function(s, w, h)
         draw.RoundedBox(4, 0, 0, w, h, Color(0,0,0,150))
         surface.SetDrawColor(Theme.outline); surface.DrawOutlinedRect(0,0,w,h)
+        
+        -- [FIX] If paused, don't update visualizer data (Freezes it)
         if currentStream and musicplayer.GetFFT then
-            local fftData = musicplayer.GetFFT(currentStream, 64) 
-            if fftData and #fftData > 0 then
-                local barWidth = w / #fftData
+            if not isPaused then
+                cachedFFT = musicplayer.GetFFT(currentStream, 64) or {}
+            end
+            
+            if cachedFFT and #cachedFFT > 0 then
+                local barWidth = w / #cachedFFT
                 local spacing = 1
                 surface.SetDrawColor(Theme.vis_color)
-                local volMultiplier = math.max(currentVolume * 10, 10)
-                for i = 1, #fftData do
-                    local val = math.Clamp(fftData[i] * volMultiplier, 0, 10)
+                local volMultiplier = math.max(currentVolume * 10, 10) -- Keep visualizer responsive
+                for i = 1, #cachedFFT do
+                    local val = math.Clamp(cachedFFT[i] * volMultiplier, 0, 10)
                     local barHeight = val * h
                     surface.DrawRect((i-1) * barWidth, h - barHeight, barWidth - spacing, barHeight)
                 end
             end
         end
+        
         local txt = currentSongName
         surface.SetFont("DermaLarge")
         local tw, th = surface.GetTextSize(txt)
@@ -1150,7 +1218,46 @@ end
     end
 
     local seekContainer = vgui.Create("DPanel", rightPanel); seekContainer:Dock(TOP); seekContainer:SetHeight(70); seekContainer:DockMargin(20, 10, 20, 0); seekContainer.Paint = function() end
-    local lblTime = vgui.Create("DLabel", seekContainer); lblTime:Dock(TOP); lblTime:SetText("0:00 / 0:00"); lblTime:SetContentAlignment(5); lblTime:SetTextColor(Theme.text)
+    
+    -- [FIX] CONVERT lblTime TO DButton FOR DOUBLE CLICK SUPPORT
+    local lblTime = vgui.Create("DButton", seekContainer); 
+    lblTime:Dock(TOP); 
+    lblTime:SetText("0:00 / 0:00"); 
+    lblTime:SetContentAlignment(5); 
+    lblTime:SetTextColor(Theme.text)
+    lblTime:SetAutoStretchVertical(false) -- Keep size fixed
+    lblTime:SetTall(20)
+    lblTime.Paint = function() end -- Remove default button look
+    
+    lblTime.DoDoubleClick = function()
+        Derma_StringRequest("Seek to Time", "Enter time (e.g. 1:30 or 90):", "", function(text)
+            local min, sec = text:match("(%d+):(%d+)")
+            local targetSec = 0
+            
+            if min and sec then
+                targetSec = (tonumber(min) * 60) + tonumber(sec)
+            else
+                targetSec = tonumber(text) or 0
+            end
+            
+            if targetSec < 0 then targetSec = 0 end
+            if currentDuration > 0 and targetSec > currentDuration then targetSec = currentDuration end
+            
+            -- Apply Seek
+            if isNetworkedPlayback and LocalPlayer():IsAdmin() then
+                net.Start("MusicPlayer_Control")
+                    net.WriteString("seek")
+                    net.WriteFloat(targetSec)
+                    net.WriteFloat(0)
+                net.SendToServer()
+            else
+                if currentStream then musicplayer.SetPos(currentStream, targetSec) end
+            end
+            
+            lblTime:SetText(SecondsToTime(targetSec) .. " / " .. SecondsToTime(currentDuration))
+        end)
+    end
+
     local seekSlider = vgui.Create("DSlider", seekContainer); seekSlider:Dock(TOP); seekSlider:SetHeight(30); seekSlider:SetSlideX(0); seekSlider:SetLockY(0.5)
     
     seekSlider.Paint = function(s, w, h) 
@@ -1158,50 +1265,50 @@ end
         draw.RoundedBox(2, 0, h/2 - 2, w * s:GetSlideX(), 4, Theme.accent)
     end
     seekSlider.Knob.Paint = function(s, w, h) draw.RoundedBox(8, 0, 0, w, h, Theme.text) end
+    
     seekSlider.OnValueChanged = function(self, val)
-    if not self:IsEditing() or currentDuration <= 0 then return end
+        if not self:IsEditing() or currentDuration <= 0 then return end
 
-    local pos = val * currentDuration
-    lblTime:SetText(SecondsToTime(pos) .. " / " .. SecondsToTime(currentDuration))
+        local pos = val * currentDuration
+        lblTime:SetText(SecondsToTime(pos) .. " / " .. SecondsToTime(currentDuration))
 
-    -- 🌍 REALTIME SEEK BROADCAST (Admins only)
-    if isNetworkedPlayback and LocalPlayer():IsAdmin() then
-        net.Start("MusicPlayer_Control")
-            net.WriteString("seek")
-            net.WriteFloat(pos)
-            net.WriteFloat(0)
-        net.SendToServer()
-    end
-end
-
-seekSlider.OnMousePressed = function(self, m)
-    if m ~= MOUSE_LEFT then return end
-    if currentDuration <= 0 then return end
-
-    -- Convert mouse X to slider position
-    local x = self:ScreenToLocal(gui.MouseX(), gui.MouseY())
-    local frac = math.Clamp(x / self:GetWide(), 0, 1)
-
-    self:SetSlideX(frac)
-
-    local pos = frac * currentDuration
-
-    -- Apply seek immediately
-    if isNetworkedPlayback and LocalPlayer():IsAdmin() then
-        net.Start("MusicPlayer_Control")
-            net.WriteString("seek")
-            net.WriteFloat(pos)
-            net.WriteFloat(0)
-        net.SendToServer()
-    else
-        if currentStream then
-            musicplayer.SetPos(currentStream, pos)
+        -- 🌍 REALTIME SEEK BROADCAST (Admins only)
+        if isNetworkedPlayback and LocalPlayer():IsAdmin() then
+            net.Start("MusicPlayer_Control")
+                net.WriteString("seek")
+                net.WriteFloat(pos)
+                net.WriteFloat(0)
+            net.SendToServer()
         end
     end
 
-    self:MouseCapture(true)
-end
+    seekSlider.OnMousePressed = function(self, m)
+        if m ~= MOUSE_LEFT then return end
+        if currentDuration <= 0 then return end
 
+        -- Convert mouse X to slider position
+        local x = self:ScreenToLocal(gui.MouseX(), gui.MouseY())
+        local frac = math.Clamp(x / self:GetWide(), 0, 1)
+
+        self:SetSlideX(frac)
+
+        local pos = frac * currentDuration
+
+        -- Apply seek immediately
+        if isNetworkedPlayback and LocalPlayer():IsAdmin() then
+            net.Start("MusicPlayer_Control")
+                net.WriteString("seek")
+                net.WriteFloat(pos)
+                net.WriteFloat(0)
+            net.SendToServer()
+        else
+            if currentStream then
+                musicplayer.SetPos(currentStream, pos)
+            end
+        end
+
+        self:MouseCapture(true)
+    end
     
     seekSlider.Knob.OnMouseReleased = function(self, m) 
         local pos = seekSlider:GetSlideX() * currentDuration
@@ -1213,56 +1320,68 @@ end
         self:MouseCapture(false); return DButton.OnMouseReleased(self, m) 
     end
 
-    local function CreateCustomSlider(parent, label, min, max, default, onSlide)
-        local panel = vgui.Create("DPanel", parent); panel:Dock(TOP); panel:SetHeight(50); panel:DockMargin(10, 5, 10, 5); panel.Paint = function() end
-        local topBar = vgui.Create("DPanel", panel); topBar:Dock(TOP); topBar:SetHeight(20); topBar.Paint = function() end
-        local lbl = vgui.Create("DLabel", topBar); lbl:Dock(LEFT); lbl:SetWidth(200); lbl:SetText(label); lbl:SetTextColor(Theme.text); lbl:SetFont("DermaDefaultBold")
-        local valLbl = vgui.Create("DLabel", topBar); valLbl:Dock(RIGHT); valLbl:SetWidth(50); valLbl:SetText(string.format("%.2f", default)); valLbl:SetTextColor(Theme.accent); valLbl:SetFont("DermaDefaultBold"); valLbl:SetContentAlignment(6); valLbl:SetMouseInputEnabled(true); valLbl:SetCursor("hand")
-        local slider = vgui.Create("DSlider", panel); slider:Dock(FILL); slider:DockMargin(0, 5, 0, 0); slider:SetLockY(0.5); slider:SetSlideX((default - min) / (max - min))
-        slider.CurrentVal = default
+    -- =========================================================
+    -- [FIX] STANDARD SLIDERS WITH MANUAL DRAGGING FLAGS
+    -- =========================================================
 
-        local function UpdateValue(num, fromNet)
-             num = math.Clamp(num, min, max)
-             slider:SetSlideX((num - min) / (max - min)); valLbl:SetText(string.format("%.2f", num)); slider.CurrentVal = num
-             if not fromNet then onSlide(num) end
+    -- VOLUME SLIDER
+    local volSlider = vgui.Create("DNumSlider", rightPanel)
+    volSlider:Dock(TOP)
+    volSlider:DockMargin(20, 5, 20, 5)
+    volSlider:SetText("Volume")
+    volSlider:SetMin(0)
+    volSlider:SetMax(10) -- Standard Volume Range
+    volSlider:SetDecimals(2)
+    volSlider:SetValue(currentVolume)
+    volSlider.Label:SetTextColor(Theme.text)
+    frame.VolSlider = volSlider
+    
+    -- [FIX] Manual Dragging Hooks
+    volSlider.OnMousePressed = function() LocalPlayerDraggingVol = true end
+    volSlider.OnMouseReleased = function() LocalPlayerDraggingVol = false end
+
+    volSlider.OnValueChanged = function(self, val)
+        currentVolume = val
+        if currentStream then musicplayer.SetVolume(currentStream, currentVolume) end
+
+        -- [FIX] Network update ONLY if dragging
+        if isNetworkedPlayback and LocalPlayer():IsAdmin() and LocalPlayerDraggingVol then
+            net.Start("MusicPlayer_Control")
+                net.WriteString("update")
+                net.WriteFloat(currentVolume)
+                net.WriteFloat(currentPitch)
+            net.SendToServer()
         end
+    end
 
-        valLbl.DoDoubleClick = function()
-            local edit = vgui.Create("DTextEntry", topBar); edit:SetPos(valLbl:GetPos()); edit:SetSize(valLbl:GetSize()); edit:SetText(valLbl:GetText()); edit:SetFont("DermaDefaultBold"); edit:RequestFocus(); edit:SelectAllText()
-            local function Submit() if IsValid(edit) then local num = tonumber(edit:GetText()) if num then UpdateValue(num) end edit:Remove(); valLbl:SetVisible(true) end end
-            edit.OnEnter = Submit; edit.OnLoseFocus = Submit; valLbl:SetVisible(false) 
+    -- PITCH SLIDER
+    local pitchSlider = vgui.Create("DNumSlider", rightPanel)
+    pitchSlider:Dock(TOP)
+    pitchSlider:DockMargin(20, 5, 20, 5)
+    pitchSlider:SetText("Pitch / Speed")
+    pitchSlider:SetMin(0.5) -- Half speed
+    pitchSlider:SetMax(10.0) -- Double speed
+    pitchSlider:SetDecimals(2)
+    pitchSlider:SetValue(currentPitch)
+    pitchSlider.Label:SetTextColor(Theme.text)
+    frame.PitchSlider = pitchSlider
+    
+    -- [FIX] Manual Dragging Hooks
+    pitchSlider.OnMousePressed = function() LocalPlayerDraggingPitch = true end
+    pitchSlider.OnMouseReleased = function() LocalPlayerDraggingPitch = false end
+
+    pitchSlider.OnValueChanged = function(self, val)
+        currentPitch = val
+        if currentStream then musicplayer.SetPitch(currentStream, currentPitch) end
+
+        -- [FIX] Network update ONLY if dragging
+        if isNetworkedPlayback and LocalPlayer():IsAdmin() and LocalPlayerDraggingPitch then
+            net.Start("MusicPlayer_Control")
+                net.WriteString("update")
+                net.WriteFloat(currentVolume)
+                net.WriteFloat(currentPitch)
+            net.SendToServer()
         end
-
-        slider.Paint = function(s, w, h) draw.RoundedBox(2, 0, h/2 - 2, w, 4, Color(0, 0, 0, 255)); draw.RoundedBox(2, 0, h/2 - 2, w * s:GetSlideX(), 4, Theme.accent) end
-        slider.Knob.Paint = function(s, w, h) draw.RoundedBox(8, 0, 0, w, h, Theme.text) end
-        slider.OnValueChanged = function(s)
-		local finalVal = min + (s:GetSlideX() * (max - min))
-		valLbl:SetText(string.format("%.2f", finalVal))
-		slider.CurrentVal = finalVal
-		onSlide(finalVal)
-
-		-- 🌍 REALTIME NETWORK BROADCAST (Admins only)
-		if isNetworkedPlayback and LocalPlayer():IsAdmin() then
-			local vol = currentVolume
-			local pitch = 1.0
-			if frame.PitchSlider then pitch = frame.PitchSlider.CurrentVal end
-
-			net.Start("MusicPlayer_Control")
-				net.WriteString("update")
-				net.WriteFloat(vol)
-				net.WriteFloat(pitch)
-			net.SendToServer()
-		end
-	end
-
-        slider.Knob.OnMouseReleased = function(self, m)
-             if isNetworkedPlayback then
-                 local pitch = 1.0; if frame.PitchSlider then pitch = frame.PitchSlider.CurrentVal end
-                 net.Start("MusicPlayer_Control"); net.WriteString("update"); net.WriteFloat(currentVolume); net.WriteFloat(pitch); net.SendToServer()
-             end
-             self:MouseCapture(false); return DButton.OnMouseReleased(self, m)
-        end
-        return slider
     end
 
     local btnPlay = vgui.Create("DButton", rightPanel); btnPlay:Dock(TOP); btnPlay:DockMargin(20, 10, 20, 10); btnPlay:SetHeight(40); btnPlay:SetText("PLAY SELECTED"); btnPlay:SetTextColor(Color(255,255,255))
@@ -1270,44 +1389,179 @@ end
     btnPlay.Paint = function(s, w, h) draw.RoundedBox(4, 0, 0, w, h, Theme.accent); surface.SetDrawColor(Theme.outline); surface.DrawOutlinedRect(0,0,w,h) end
     btnPlay.DoClick = function() if frame.SelectedFile then PlayFile(frame.SelectedFile) end end
 
+    -- [NEW] PAUSE BUTTON
+    local btnPause = vgui.Create("DButton", rightPanel)
+    btnPause:Dock(TOP); btnPause:DockMargin(20, 0, 20, 10); btnPause:SetHeight(30); btnPause:SetText("PAUSE"); btnPause:SetTextColor(Color(255,255,255))
+    btnPause:SetFont("DermaDefaultBold")
+    btnPause.Paint = function(s,w,h) draw.RoundedBox(4,0,0,w,h, Color(200, 150, 50)) end
+    btnPause.DoClick = function()
+        if not currentStream then return end
+        
+        if isPaused then
+            -- Resume
+            isPaused = false
+            btnPause:SetText("PAUSE")
+            if musicplayer.Resume then
+                musicplayer.Resume(currentStream)
+            else
+                -- Fallback for modules without Resume
+                musicplayer.SetVolume(currentStream, currentVolume)
+            end
+            notification.AddLegacy("Resumed", NOTIFY_GENERIC, 1)
+        else
+            -- Pause
+            isPaused = true
+            btnPause:SetText("RESUME")
+            if musicplayer.Pause then
+                musicplayer.Pause(currentStream)
+            else
+                -- Fallback for modules without Pause
+                musicplayer.SetVolume(currentStream, 0)
+            end
+            notification.AddLegacy("Paused", NOTIFY_GENERIC, 1)
+        end
+    end
+
     local btnStop = vgui.Create("DButton", rightPanel); btnStop:Dock(TOP); btnStop:DockMargin(20, 0, 20, 20); btnStop:SetHeight(30); btnStop:SetText("STOP"); btnStop:SetTextColor(Color(255,255,255))
     btnStop.Paint = function(s,w,h) draw.RoundedBox(4,0,0,w,h, Color(180, 50, 50)) end
     frame.btnStop = btnStop
     
-btnStop.DoClick = function()
-    -- 🌍 Admin stops for everyone
-    if isNetworkedPlayback and LocalPlayer():IsAdmin() then
-        net.Start("MusicPlayer_Control")
-            net.WriteString("stop")
-            net.WriteFloat(0)
-            net.WriteFloat(0)
-        net.SendToServer()
+    btnStop.DoClick = function()
+        -- 🌍 Admin stops for everyone
+        if isNetworkedPlayback and LocalPlayer():IsAdmin() then
+            net.Start("MusicPlayer_Control")
+                net.WriteString("stop")
+                net.WriteFloat(0)
+                net.WriteFloat(0)
+            net.SendToServer()
+        else
+            -- 🧍 Non-admin: stop locally only
+            if currentStream then
+                musicplayer.Stop(currentStream)
+                currentStream = nil
+                currentSongName = "Stopped (Local)"
+                seekSlider:SetSlideX(0)
+                isPaused = false
+                if IsValid(btnPause) then btnPause:SetText("PAUSE") end
+            end
+        end
+        amITheDJ = false
+    end
 
-    -- 🧍 Non-admin: stop locally only
-    else
-        if currentStream then
-            musicplayer.Stop(currentStream)
-            currentStream = nil
-            currentSongName = "Stopped (Local)"
-            seekSlider:SetSlideX(0)
+    -- [NEW] LOOP BUTTON (Moved to Main Controls for easier access)
+    local btnLoop = vgui.Create("DButton", rightPanel)
+    btnLoop:Dock(TOP)
+    btnLoop:DockMargin(20, 0, 20, 5)
+    btnLoop:SetHeight(30)
+    btnLoop:SetText("Loop: OFF")
+    btnLoop:SetTextColor(Theme.text)
+    btnLoop:SetFont("DermaDefaultBold")
+    
+    btnLoop.Paint = function(s,w,h)
+        if isLooping then
+            draw.RoundedBox(4,0,0,w,h, Theme.accent)
+        else
+            draw.RoundedBox(4,0,0,w,h, Theme.panel_bg)
+        end
+        surface.SetDrawColor(Theme.outline)
+        surface.DrawOutlinedRect(0,0,w,h)
+    end
+    
+    btnLoop.DoClick = function()
+        isLooping = not isLooping
+        btnLoop:SetText(isLooping and "Loop: ON" or "Loop: OFF")
+        notification.AddLegacy(isLooping and "Loop Enabled" or "Loop Disabled", NOTIFY_GENERIC, 2)
+    end
+
+
+    -- [NEW] PLAY GLOBAL BUTTON
+    local btnPlayGlobal = vgui.Create("DButton", rightPanel)
+    btnPlayGlobal:Dock(TOP)
+    btnPlayGlobal:DockMargin(20, 5, 20, 5)
+    btnPlayGlobal:SetHeight(30)
+    btnPlayGlobal:SetText("PLAY SELECTED (GLOBAL)")
+    btnPlayGlobal:SetTextColor(Color(100, 255, 100))
+    btnPlayGlobal:SetFont("DermaDefaultBold")
+    btnPlayGlobal.Paint = function(s,w,h) draw.RoundedBox(4,0,0,w,h, Color(50, 150, 50)) end
+    btnPlayGlobal.DoClick = function()
+        if not LocalPlayer():IsAdmin() then
+            notification.AddLegacy("Admin only!", NOTIFY_ERROR, 2)
+            return
+        end
+        if frame.SelectedFile then
+            notification.AddLegacy("Playing Globally: " .. string.GetFileFromFilename(frame.SelectedFile), NOTIFY_GENERIC, 4)
+            
+            -- [FIX] Set DJ flag BEFORE PlayFile
+            amITheDJ = true
+            
+            net.Start("MusicPlayer_Broadcast")
+            net.WriteString(frame.SelectedFile)
+            net.SendToServer()
+            isNetworkedPlayback = true
+            
+            -- Update local stream to match global
+            PlayFile(frame.SelectedFile, true) -- Pass TRUE to keep networked state
+            if IsValid(frame.btnStop) then
+                frame.btnStop:SetText("STOP")
+                frame.btnStop.Paint = function(s,w,h) draw.RoundedBox(4,0,0,w,h, Color(180, 50, 50)) end 
+            end
+        else
+            notification.AddLegacy("No file selected!", NOTIFY_ERROR, 2)
         end
     end
 
-    amITheDJ = false
-end
-
-
-    frame.VolSlider = CreateCustomSlider(rightPanel, "Volume", 0, 10, 0.5, function(val) currentVolume = val; if currentStream then musicplayer.SetVolume(currentStream, val) end end)
-    frame.PitchSlider = CreateCustomSlider(rightPanel, "Pitch / Speed", 0.1, 10, 1.0, function(val) if currentStream then musicplayer.SetPitch(currentStream, val) end end)
+    -- [NEW] STOP GLOBAL BUTTON
+    local btnStopGlobal = vgui.Create("DButton", rightPanel)
+    btnStopGlobal:Dock(TOP)
+    btnStopGlobal:DockMargin(20, 5, 20, 5)
+    btnStopGlobal:SetHeight(30)
+    btnStopGlobal:SetText("STOP GLOBAL")
+    btnStopGlobal:SetTextColor(Color(255,255,255))
+    btnStopGlobal:SetFont("DermaDefaultBold")
+    btnStopGlobal.Paint = function(s,w,h) draw.RoundedBox(4,0,0,w,h, Color(150, 50, 50)) end
+    btnStopGlobal.DoClick = function()
+        if not LocalPlayer():IsAdmin() then
+            notification.AddLegacy("Admin only!", NOTIFY_ERROR, 2)
+            return
+        end
+        net.Start("MusicPlayer_Control")
+        net.WriteString("stop")
+        net.WriteFloat(0)
+        net.WriteFloat(0)
+        net.SendToServer()
+        -- Local stop logic too
+        if currentStream then musicplayer.Stop(currentStream) end
+        currentStream = nil
+        isPaused = false
+        currentSongName = "Stopped Globally."
+        if IsValid(frame.btnStop) then
+            frame.btnStop:SetText("STOP")
+            frame.btnStop.Paint = function(s,w,h) draw.RoundedBox(4,0,0,w,h, Color(180, 50, 50)) end 
+        end
+    end
 
     local lastPlayedPath = nil
 
-    function PlayFile(path)
+    -- [FIX] ADDED keepGlobalState FLAG
+    function PlayFile(path, keepGlobalState)
         if currentStream then musicplayer.Stop(currentStream) end
-        isNetworkedPlayback = false -- Reset net flag if playing locally
+        
+        -- Only reset networked playback if we aren't explicitly keeping it (e.g. Admin loop)
+        if not keepGlobalState then
+            isNetworkedPlayback = false
+        end
+        
+        isPaused = false -- Reset pause state
         lastPlayedPath = path
         
         if IsValid(frame.btnStop) then frame.btnStop:SetText("STOP"); frame.btnStop.Paint = function(s,w,h) draw.RoundedBox(4,0,0,w,h, Color(180, 50, 50)) end end
+        if IsValid(btnPause) then btnPause:SetText("PAUSE") end
+
+        -- [FIX] Reset Pitch to 1.0 on new song play (Visual)
+        currentPitch = 1.0
+        if frame.PitchSlider then
+            frame.PitchSlider:SetValue(1.0)
+        end
         
         -- Identify if this song is in our queue
         currentQueueIndex = 0
@@ -1320,7 +1574,8 @@ end
         if currentStream then
             currentDuration = musicplayer.GetLength(currentStream)
             musicplayer.SetVolume(currentStream, currentVolume)
-            if frame.PitchSlider then musicplayer.SetPitch(currentStream, frame.PitchSlider.CurrentVal) end
+            -- [FIX] Explicitly set pitch to 1.0
+            musicplayer.SetPitch(currentStream, 1.0)
             currentSongName = string.GetFileFromFilename(path) 
             lblTime:SetText("0:00 / " .. SecondsToTime(currentDuration))
         else
@@ -1381,6 +1636,9 @@ timer.Create(timerName, 0.05, 0, function()
     end
 
     if not currentStream then return end
+    
+    -- [NEW] If paused, don't update seek or check for end of track
+    if isPaused then return end
 
     -- 1. Update Slider
     if not seekSlider:IsEditing() then
@@ -1409,9 +1667,11 @@ timer.Create(timerName, 0.05, 0, function()
                 if not path then return end
 
                 if isNetworkedPlayback and amITheDJ then
+                    -- [FIX] Broadcast AND Play Locally
                     net.Start("MusicPlayer_Broadcast")
                         net.WriteString(path)
                     net.SendToServer()
+                    PlayFile(path, true) -- Pass true to keep global state
                 else
                     PlayFile(path)
                 end
